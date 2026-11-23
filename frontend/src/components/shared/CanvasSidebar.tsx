@@ -28,12 +28,12 @@ export default function CanvasSidebar() {
   return (
     <aside className="w-24 bg-slate-900 text-white flex flex-col items-center py-6 shrink-0 select-none shadow-xl sticky top-0 h-screen z-50">
       {/* Canvas Logo */}
-      <Link href="/student/dashboard" className="mb-8 flex flex-col items-center group">
-        <div className="w-12 h-12 rounded-full bg-indigo-600 flex items-center justify-center shadow-lg group-hover:scale-105 transition-transform">
+      <div className="mb-8 flex flex-col items-center">
+        <div className="w-12 h-12 rounded-full bg-indigo-600 flex items-center justify-center shadow-lg">
           <GraduationCap className="w-7 h-7 text-white" />
         </div>
         <span className="text-[11px] font-bold tracking-wider mt-2 text-indigo-300">Basira LMS</span>
-      </Link>
+      </div>
 
       {/* Navigation Links */}
       <nav className="flex-1 w-full flex flex-col items-center space-y-2">
