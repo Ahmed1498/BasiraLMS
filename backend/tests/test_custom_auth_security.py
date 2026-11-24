@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException, Request, Response
+from fastapi import BackgroundTasks, HTTPException, Request, Response
 from unittest.mock import AsyncMock, Mock, patch
 
 from app.api import auth
@@ -145,7 +145,7 @@ def test_registration_ignores_client_admin_role(monkeypatch):
     db.execute.return_value = result_with_scalar(None)
     db.add = Mock()
     monkeypatch.setattr(auth, "create_auth_token", AsyncMock(return_value="verification-token"))
-    monkeypatch.setattr(auth, "send_auth_link", AsyncMock())
+    background_tasks = BackgroundTasks()
 
     asyncio.run(
         auth.register(
@@ -155,6 +155,7 @@ def test_registration_ignores_client_admin_role(monkeypatch):
                 full_name="New User",
                 role="admin",
             ),
+            background_tasks,
             make_request("192.0.2.2"),
             db,
         )
@@ -163,6 +164,100 @@ def test_registration_ignores_client_admin_role(monkeypatch):
     created_user = db.add.call_args.args[0]
     assert created_user.role == "student"
     assert created_user.email != settings.ADMIN_EMAIL
+    assert len(background_tasks.tasks) == 1
+    assert background_tasks.tasks[0].func is auth._send_auth_link_background
+
+
+def test_forgot_password_schedules_email_without_sending_inline(monkeypatch):
+    user = make_user()
+    db = AsyncMock()
+    db.execute.return_value = result_with_scalar(user)
+    monkeypatch.setattr(auth, "create_auth_token", AsyncMock(return_value="reset-token"))
+    background_tasks = BackgroundTasks()
+
+    result = asyncio.run(
+        auth.forgot_password(
+            auth.ForgotPasswordRequest(email=user.email),
+            background_tasks,
+            make_request("192.0.2.4"),
+            db,
+        )
+    )
+
+    assert result == auth.FORGOT_RESPONSE
+    assert len(background_tasks.tasks) == 1
+    assert background_tasks.tasks[0].func is auth._send_auth_link_background
+    assert background_tasks.tasks[0].args[2] == "password_reset"
+
+
+def test_resend_email_uses_api_and_logs_only_failure_status(monkeypatch, caplog):
+    class FakeResponse:
+        is_error = True
+        status_code = 429
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+            self.request = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            return None
+
+        async def post(self, url, **kwargs):
+            self.request = (url, kwargs)
+            return FakeResponse()
+
+    clients = []
+
+    def create_client(timeout):
+        client = FakeAsyncClient(timeout)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "sensitive-api-key")
+    monkeypatch.setattr(settings, "EMAIL_FROM", "Basira <mail@example.com>")
+    monkeypatch.setattr(auth.httpx, "AsyncClient", create_client)
+
+    with pytest.raises(auth.EmailDeliveryError):
+        asyncio.run(
+            auth.send_auth_email(
+                "private-recipient@example.com",
+                "Private subject",
+                "Private email body",
+                "<p>Private email body</p>",
+            )
+        )
+
+    client = clients[0]
+    url, request = client.request
+    assert url == "https://api.resend.com/emails"
+    assert client.timeout == 10
+    assert request["headers"]["Authorization"] == "Bearer sensitive-api-key"
+    assert request["json"] == {
+        "from": "Basira <mail@example.com>",
+        "to": ["private-recipient@example.com"],
+        "subject": "Private subject",
+        "html": "<p>Private email body</p>",
+    }
+    assert "status_code=429" in caplog.text
+    assert "sensitive-api-key" not in caplog.text
+    assert "private-recipient@example.com" not in caplog.text
+    assert "Private email body" not in caplog.text
+
+
+def test_smtp_is_used_when_resend_key_is_missing(monkeypatch):
+    send_sync = Mock()
+    to_thread = AsyncMock()
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "")
+    monkeypatch.setattr(auth, "_send_email_sync", send_sync)
+    monkeypatch.setattr(auth.asyncio, "to_thread", to_thread)
+
+    asyncio.run(auth.send_auth_email("user@example.com", "Subject", "Body"))
+
+    to_thread.assert_awaited_once_with(send_sync, "user@example.com", "Subject", "Body")
 
 
 def test_fifth_failed_login_locks_account_for_fifteen_minutes(monkeypatch):

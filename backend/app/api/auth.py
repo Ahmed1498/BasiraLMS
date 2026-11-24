@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import html
 import logging
 import secrets
 import smtplib
@@ -11,9 +12,10 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from urllib.parse import quote
 
+import httpx
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHashError, VerificationError
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from jose import jwt
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
@@ -260,7 +262,42 @@ def _send_email_sync(recipient: str, subject: str, body: str) -> None:
         ) from exc
 
 
-async def send_auth_email(recipient: str, subject: str, body: str) -> None:
+async def send_auth_email(
+    recipient: str,
+    subject: str,
+    body: str,
+    html_body: str | None = None,
+) -> None:
+    if settings.RESEND_API_KEY:
+        if not settings.EMAIL_FROM:
+            logger.error("Resend email delivery failed; status_code=not_sent")
+            raise EmailDeliveryError("Resend email delivery failed")
+
+        escaped_body = html.escape(body).replace("\n", "<br>")
+        payload = {
+            "from": settings.EMAIL_FROM,
+            "to": [recipient],
+            "subject": subject,
+            "html": html_body or f"<p>{escaped_body}</p>",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+                    json=payload,
+                )
+        except httpx.RequestError as exc:
+            logger.error("Resend email delivery failed; status_code=unavailable")
+            raise EmailDeliveryError("Resend email delivery failed") from exc
+        if response.is_error:
+            logger.error(
+                "Resend email delivery failed; status_code=%s",
+                response.status_code,
+            )
+            raise EmailDeliveryError("Resend email delivery failed")
+        return
+
     try:
         await asyncio.to_thread(_send_email_sync, recipient, subject, body)
     except EmailDeliveryError as exc:
@@ -308,11 +345,24 @@ async def send_auth_link(user: User, token: str, purpose: str) -> None:
     else:
         raise ValueError("Unsupported authentication email purpose")
     link = _frontend_link(path, token)
+    html_body = (
+        f"<p>Use this link to {html.escape(action)}:</p>"
+        f'<p><a href="{html.escape(link, quote=True)}">{html.escape(link)}</a></p>'
+        "<p>If you did not request this, ignore this email.</p>"
+    )
     await send_auth_email(
         user.email,
         subject,
         f"Use this link to {action}:\n\n{link}\n\nIf you did not request this, ignore this email.",
+        html_body,
     )
+
+
+async def _send_auth_link_background(user: User, token: str, purpose: str) -> None:
+    try:
+        await send_auth_link(user, token, purpose)
+    except EmailDeliveryError:
+        return
 
 
 async def _consume_auth_token(
@@ -368,6 +418,7 @@ def _raise_invalid_login() -> None:
 @router.post("/register", status_code=201)
 async def register(
     data: RegisterRequest,
+    background_tasks: BackgroundTasks,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
@@ -398,13 +449,12 @@ async def register(
         purpose="verify_email",
         lifetime=timedelta(hours=VERIFY_TOKEN_HOURS),
     )
-    try:
-        await send_auth_link(user, token, "verify_email")
-    except EmailDeliveryError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not send the verification email. Check the SMTP configuration.",
-        ) from exc
+    background_tasks.add_task(
+        _send_auth_link_background,
+        user,
+        token,
+        "verify_email",
+    )
     return {"message": "Account created. Check your email to verify it."}
 
 
@@ -502,6 +552,7 @@ async def verify_email(
 @router.post("/forgot-password")
 async def forgot_password(
     data: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
@@ -517,16 +568,12 @@ async def forgot_password(
             purpose="password_reset",
             lifetime=timedelta(minutes=RESET_TOKEN_MINUTES),
         )
-        try:
-            await send_auth_link(user, token, "password_reset")
-        except EmailDeliveryError:
-            token_hash = _hash_token(token)
-            token_result = await db.execute(
-                select(AuthToken).where(AuthToken.token_hash == token_hash)
-            )
-            token_record = token_result.scalar_one_or_none()
-            if token_record is not None:
-                token_record.used_at = datetime.now(timezone.utc)
+        background_tasks.add_task(
+            _send_auth_link_background,
+            user,
+            token,
+            "password_reset",
+        )
     return FORGOT_RESPONSE
 
 

@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM_EMAIL: str = ""
     SMTP_FROM_NAME: str = "Basira LMS"
+    RESEND_API_KEY: str = ""
+    EMAIL_FROM: str = ""
     FRONTEND_ORIGINS: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"],
         min_length=1,
